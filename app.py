@@ -28,7 +28,6 @@ def extract_blocks(text, block_name):
 
     while True:
         match = pattern.search(text, position)
-
         if not match:
             break
 
@@ -56,7 +55,6 @@ def extract_blocks(text, block_name):
                 depth += 1
             elif char == ")":
                 depth -= 1
-
                 if depth == 0:
                     end = i + 1
                     break
@@ -71,7 +69,7 @@ def extract_blocks(text, block_name):
 
 
 def parse_pcb(text):
-    """Extract basic component references, tracks and vias."""
+    """Extract basic component references, track segments and vias."""
 
     components = re.findall(
         r'\(property\s+"Reference"\s+"([^"]+)"',
@@ -124,15 +122,11 @@ def parse_pcb(text):
         })
 
     vias = extract_blocks(text, "via")
-
     return components, tracks, len(vias)
 
 
 def parse_drc_report(report_text):
-    """
-    Parse KiCad DRC summary and individual violations.
-    Unknown severities are not assumed to be errors or warnings.
-    """
+    """Parse KiCad text DRC report summary and violation details."""
 
     result = {
         "Total violations": None,
@@ -143,7 +137,6 @@ def parse_drc_report(report_text):
         "Violations": []
     }
 
-    # Parse total DRC violations.
     total_matches = re.findall(
         r"\*\*\s*Found\s+(\d+)\s+DRC violations?\s*\*\*",
         report_text,
@@ -153,7 +146,6 @@ def parse_drc_report(report_text):
     if total_matches:
         result["Total violations"] = int(total_matches[-1])
 
-    # Parse unconnected pads.
     unconnected_matches = re.findall(
         r"\*\*\s*Found\s+(\d+)\s+unconnected pads?\s*\*\*",
         report_text,
@@ -161,11 +153,8 @@ def parse_drc_report(report_text):
     )
 
     if unconnected_matches:
-        result["Unconnected pads"] = int(
-            unconnected_matches[-1]
-        )
+        result["Unconnected pads"] = int(unconnected_matches[-1])
 
-    # Parse footprint errors.
     footprint_matches = re.findall(
         r"\*\*\s*Found\s+(\d+)\s+Footprint errors?\s*\*\*",
         report_text,
@@ -173,14 +162,15 @@ def parse_drc_report(report_text):
     )
 
     if footprint_matches:
-        result["Footprint errors"] = int(
-            footprint_matches[-1]
-        )
+        result["Footprint errors"] = int(footprint_matches[-1])
 
-    # Find individual violation blocks.
+    # KiCad text reports use entries such as:
+    # [silk_overlap]: Silkscreen clearance
+    #     Rule: board setup constraints silk; warning
     blocks = re.split(
-        r"(?=\[[^\]]+\]:)",
-        report_text
+        r"(?=^\[[^\]]+\]:)",
+        report_text,
+        flags=re.MULTILINE
     )
 
     for block in blocks:
@@ -201,10 +191,11 @@ def parse_drc_report(report_text):
             flags=re.IGNORECASE
         )
 
-        if rule_match:
-            severity = rule_match.group(1).capitalize()
-        else:
-            severity = "Unspecified"
+        severity = (
+            rule_match.group(1).capitalize()
+            if rule_match
+            else "Unspecified"
+        )
 
         if severity == "Error":
             result["Errors"] += 1
@@ -212,7 +203,7 @@ def parse_drc_report(report_text):
             result["Warnings"] += 1
 
         details = [
-            line.strip()
+            line.strip().lstrip("@").strip()
             for line in block.splitlines()[1:]
             if line.strip().startswith("@")
         ]
@@ -228,26 +219,21 @@ def parse_drc_report(report_text):
 
 
 # ==================================================
-# 2. PAGE HEADER
+# 2. PAGE HEADER AND SETTINGS
 # ==================================================
 
 st.title("🔌 Cloud-Based PCB Design Assistant")
 
 st.write(
-    "Upload a KiCad PCB file to inspect track geometry, "
-    "review track widths and examine an exported KiCad DRC report."
+    "Analyze basic PCB geometry, review track widths, and inspect "
+    "actual DRC results exported from KiCad."
 )
 
 st.info(
-    "Prototype limitation: track-width checks are basic screening "
-    "features. This website does not execute KiCad's DRC engine "
-    "or perform validated EMI, thermal or signal-integrity simulations."
+    "This is a prototype. Track-width flags are screening results, "
+    "not proof of design-rule violations. The website displays imported "
+    "KiCad DRC reports but does not run the KiCad DRC engine itself."
 )
-
-
-# ==================================================
-# 3. SIDEBAR SETTINGS
-# ==================================================
 
 with st.sidebar:
     st.header("Analysis Settings")
@@ -258,27 +244,24 @@ with st.sidebar:
         max_value=10.0,
         value=0.20,
         step=0.05,
-        help=(
-            "User-selected screening threshold, not a universal "
-            "manufacturing limit."
-        )
+        help="A user-selected screening threshold, not a universal limit."
     )
 
     st.caption(
-        "Choose a threshold based on the actual board requirements "
-        "when known. The default is for demonstration only."
+        "Use actual board requirements when known. "
+        "The default is for demonstration only."
     )
 
 
 # ==================================================
-# 4. KICAD DRC REPORT UPLOAD AND ANALYSIS
+# 3. DRC REPORT UPLOAD
 # ==================================================
 
 st.header("1. Real KiCad DRC Report")
 
 st.write(
-    "Upload a text report exported from KiCad's Design Rules Checker "
-    "to review its summary and individual violations."
+    "In KiCad, open Inspect → Design Rules Checker, run DRC, "
+    "and save the report. Upload the resulting .rpt or .txt file here."
 )
 
 drc_file = st.file_uploader(
@@ -286,6 +269,9 @@ drc_file = st.file_uploader(
     type=["rpt", "txt"],
     key="drc_report_upload"
 )
+
+drc_results = None
+drc_text = None
 
 if drc_file is not None:
     try:
@@ -299,54 +285,48 @@ if drc_file is not None:
         errors = drc_results["Errors"]
         warnings = drc_results["Warnings"]
 
-        if total is not None:
-            st.metric("Total violations reported", total)
-        else:
-            st.warning(
-                "The total violation count could not be identified. "
-                "Please review the original report."
-            )
+        c1, c2, c3 = st.columns(3)
 
-        col1, col2 = st.columns(2)
-
-        col1.metric("Errors identified", errors)
-        col2.metric("Warnings identified", warnings)
+        c1.metric(
+            "Total violations",
+            total if total is not None else "Not identified"
+        )
+        c2.metric("Errors identified", errors)
+        c3.metric("Warnings identified", warnings)
 
         if total is not None and total == 0:
             st.success("The report indicates zero DRC violations.")
-        elif total is not None and total > 0:
+        elif total is not None:
             st.warning(
-                f"The report indicates {total} DRC violation(s). "
-                "Review their descriptions below."
+                f"KiCad reported {total} DRC violation(s). "
+                "Review the details below."
+            )
+        else:
+            st.info(
+                "The total count could not be identified automatically. "
+                "Check the original report below."
             )
 
-        # Additional checks.
-        st.subheader("Additional DRC Checks")
-
-        col3, col4 = st.columns(2)
+        c4, c5 = st.columns(2)
 
         unconnected = drc_results["Unconnected pads"]
         footprint_errors = drc_results["Footprint errors"]
 
-        col3.metric(
+        c4.metric(
             "Unconnected pads",
             unconnected if unconnected is not None else "Not reported"
         )
-
-        col4.metric(
+        c5.metric(
             "Footprint errors",
             footprint_errors
             if footprint_errors is not None
             else "Not reported"
         )
 
-        # Individual violations.
         st.subheader("Individual DRC Violations")
 
         if drc_results["Violations"]:
-            violation_df = pd.DataFrame(
-                drc_results["Violations"]
-            )
+            violation_df = pd.DataFrame(drc_results["Violations"])
 
             st.dataframe(
                 violation_df,
@@ -355,10 +335,8 @@ if drc_file is not None:
             )
 
             st.download_button(
-                "Download violations as CSV",
-                data=violation_df.to_csv(
-                    index=False
-                ).encode("utf-8"),
+                "Download DRC violations as CSV",
+                data=violation_df.to_csv(index=False).encode("utf-8"),
                 file_name="pcb_drc_violations.csv",
                 mime="text/csv",
                 key="download_drc_csv"
@@ -367,11 +345,10 @@ if drc_file is not None:
             st.success("No individual violations were listed.")
         else:
             st.info(
-                "Individual violation entries could not be extracted "
-                "automatically. See the original report below."
+                "No individual violation entries were recognized. "
+                "See the original report."
             )
 
-        # Full report.
         with st.expander("View full original DRC report"):
             st.code(drc_text, language="text")
 
@@ -386,14 +363,14 @@ if drc_file is not None:
     except UnicodeDecodeError:
         st.error(
             "Could not read this report as UTF-8 text. "
-            "Please export a plain-text report from KiCad."
+            "Export a plain-text report from KiCad and try again."
         )
 
 st.divider()
 
 
 # ==================================================
-# 5. PCB FILE UPLOAD
+# 4. PCB FILE UPLOAD
 # ==================================================
 
 st.header("2. PCB Geometry and Track Analysis")
@@ -409,7 +386,7 @@ if uploaded_file is None:
         """
         ### How to use this dashboard
 
-        1. Upload a KiCad DRC report to review DRC results.
+        1. Upload a KiCad DRC report to view actual DRC results.
         2. Upload a KiCad PCB file to inspect its geometry.
         3. Review components, track segments and vias.
         4. Adjust the track-width screening threshold.
@@ -420,7 +397,7 @@ if uploaded_file is None:
 
 
 # ==================================================
-# 6. PARSE PCB FILE
+# 5. PARSE PCB
 # ==================================================
 
 try:
@@ -474,7 +451,7 @@ try:
 
 
     # ==================================================
-    # 7. TRACK REVIEW TABLE
+    # 6. TRACK REVIEW TABLE
     # ==================================================
 
     st.subheader("Track Review")
@@ -511,16 +488,14 @@ try:
 
     st.download_button(
         "Download track results as CSV",
-        data=df[display_columns].to_csv(
-            index=False
-        ).encode("utf-8"),
+        data=df[display_columns].to_csv(index=False).encode("utf-8"),
         file_name="pcb_track_review.csv",
         mime="text/csv"
     )
 
 
     # ==================================================
-    # 8. TRACK VISUALIZATION
+    # 7. TRACK VISUALIZATION
     # ==================================================
 
     st.subheader("Extracted Track Visualization")
@@ -556,7 +531,7 @@ try:
 
 
     # ==================================================
-    # 9. COMPONENT REFERENCES
+    # 8. COMPONENT REFERENCES
     # ==================================================
 
     st.subheader("Component References")
@@ -571,7 +546,7 @@ try:
 
 
     # ==================================================
-    # 10. ANALYSIS SUMMARY
+    # 9. SUMMARY
     # ==================================================
 
     st.subheader("Analysis Summary")
@@ -603,19 +578,74 @@ try:
 
 
     # ==================================================
-    # 11. DOWNLOAD HTML ANALYSIS REPORT
+    # 10. COMBINED HTML REPORT
     # ==================================================
+
+    if drc_results is None:
+        drc_html_section = """
+        <h2>KiCad DRC Results</h2>
+        <p>No DRC report was uploaded during this session.</p>
+        """
+    else:
+        total_drc = drc_results["Total violations"]
+
+        drc_summary = pd.DataFrame({
+            "Metric": [
+                "Source DRC report",
+                "Total violations",
+                "Errors identified",
+                "Warnings identified",
+                "Unconnected pads",
+                "Footprint errors"
+            ],
+            "Result": [
+                drc_file.name,
+                total_drc if total_drc is not None else "Not identified",
+                drc_results["Errors"],
+                drc_results["Warnings"],
+                (
+                    drc_results["Unconnected pads"]
+                    if drc_results["Unconnected pads"] is not None
+                    else "Not reported"
+                ),
+                (
+                    drc_results["Footprint errors"]
+                    if drc_results["Footprint errors"] is not None
+                    else "Not reported"
+                )
+            ]
+        })
+
+        drc_html_section = (
+            "<h2>KiCad DRC Results</h2>"
+            + drc_summary.to_html(index=False, escape=True)
+        )
+
+        if drc_results["Violations"]:
+            violation_df = pd.DataFrame(drc_results["Violations"])
+            drc_html_section += (
+                "<h3>Individual DRC Violations</h3>"
+                + violation_df.to_html(index=False, escape=True)
+            )
+
+        drc_html_section += (
+            "<h3>Original DRC Report</h3><pre>"
+            + html.escape(drc_text)
+            + "</pre>"
+        )
 
     report_html = f"""
     <!DOCTYPE html>
     <html>
     <head>
     <meta charset="utf-8">
-    <title>PCB Analysis Report</title>
+    <title>Combined PCB Analysis Report</title>
     <style>
     body {{
         font-family: Arial, sans-serif;
         margin: 30px;
+        line-height: 1.5;
+        color: #222;
     }}
     table {{
         border-collapse: collapse;
@@ -626,18 +656,30 @@ try:
         border: 1px solid #ccc;
         padding: 8px;
         text-align: left;
+        overflow-wrap: anywhere;
     }}
     th {{
         background: #eaf2f8;
+    }}
+    h1, h2 {{
+        color: #17365d;
+    }}
+    pre {{
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        background: #f4f4f4;
+        padding: 12px;
     }}
     </style>
     </head>
     <body>
     <h1>Cloud-Based PCB Design Assistant</h1>
-    <p>File: {html.escape(uploaded_file.name)}</p>
-    <p>Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
+    <p><strong>PCB file:</strong>
+    {html.escape(uploaded_file.name)}</p>
+    <p><strong>Generated:</strong>
+    {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
 
-    <h2>Summary</h2>
+    <h2>PCB Geometry Summary</h2>
     {summary.to_html(index=False, escape=True)}
 
     <h2>Track Details</h2>
@@ -646,33 +688,30 @@ try:
     <h2>Component References</h2>
     <p>{html.escape(", ".join(components)) if components else "None extracted"}</p>
 
+    {drc_html_section}
+
     <h2>Limitations</h2>
     <p>
-    This report contains basic parsed PCB geometry and a configurable
-    track-width screening check. It does not certify manufacturing,
-    electrical safety, EMI compliance, thermal performance, or signal
-    integrity. The selected width threshold is not a universal design rule.
-    </p>
-
-    <h2>KiCad DRC</h2>
-    <p>
-    Actual KiCad DRC results must be generated in KiCad. The DRC report
-    upload section displays exported results; this website does not
-    execute the KiCad DRC engine.
+    Track-width flags are screening results based on the selected
+    threshold and do not prove a design-rule violation. KiCad DRC
+    results are imported from a separately generated report. This
+    website does not execute the KiCad DRC engine or certify
+    manufacturing, electrical safety, EMI, thermal performance,
+    or signal integrity.
     </p>
     </body>
     </html>
     """
 
     st.download_button(
-        "Download HTML analysis report",
+        "Download Combined PCB and DRC HTML Report",
         data=report_html.encode("utf-8"),
-        file_name="PCB_Analysis_Report.html",
+        file_name="Combined_PCB_DRC_Report.html",
         mime="text/html"
     )
 
 except UnicodeDecodeError:
-    st.error("Could not read this file as UTF-8 text.")
+    st.error("Could not read this PCB file as UTF-8 text.")
 
 except Exception as error:
     st.error("Unable to analyze this PCB file.")
