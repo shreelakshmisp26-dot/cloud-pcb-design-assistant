@@ -1,4 +1,3 @@
-                    if drc_results["Footprint errors"] is not None
                     else "Not reported"
                 )
             ]
