@@ -16,7 +16,7 @@ st.set_page_config(
 
 
 # ============================================================
-# 1. HELPER FUNCTIONS
+# 1. PCB PARSING
 # ============================================================
 
 def extract_blocks(text, block_name):
@@ -27,6 +27,7 @@ def extract_blocks(text, block_name):
 
     while True:
         match = pattern.search(text, position)
+
         if not match:
             break
 
@@ -54,6 +55,7 @@ def extract_blocks(text, block_name):
                 depth += 1
             elif char == ")":
                 depth -= 1
+
                 if depth == 0:
                     end = i + 1
                     break
@@ -68,13 +70,16 @@ def extract_blocks(text, block_name):
 
 
 def parse_pcb(text):
-    """Extract component references, track segments and vias."""
-    components = sorted(set(
-        re.findall(
-            r'\(property\s+"Reference"\s+"([^"\n]+)',
-            text
+    """Extract component references, tracks, and vias."""
+
+    components = sorted(
+        set(
+            re.findall(
+                r'\(property\s+"Reference"\s+"([^"\n]+)',
+                text
+            )
         )
-    ))
+    )
 
     components = [
         ref for ref in components
@@ -109,9 +114,12 @@ def parse_pcb(text):
 
         tracks.append({
             "Track": len(tracks) + 1,
-            "Width (mm)": float(width.group(1)) if width else None,
+            "Width (mm)": (
+                float(width.group(1)) if width else None
+            ),
             "Length (mm)": round(
-                math.hypot(x2 - x1, y2 - y1), 3
+                math.hypot(x2 - x1, y2 - y1),
+                3
             ),
             "Layer": layer.group(1) if layer else "Unknown",
             "X1": x1,
@@ -120,11 +128,18 @@ def parse_pcb(text):
             "Y2": y2,
         })
 
-    return components, tracks, len(extract_blocks(text, "via"))
+    via_count = len(extract_blocks(text, "via"))
 
+    return components, tracks, via_count
+
+
+# ============================================================
+# 2. DRC REPORT PARSING
+# ============================================================
 
 def parse_drc_report(report_text):
     """Parse a text-format KiCad DRC report."""
+
     result = {
         "Total violations": None,
         "Errors": 0,
@@ -152,6 +167,7 @@ def parse_drc_report(report_text):
             report_text,
             flags=re.IGNORECASE
         )
+
         if matches:
             result[key] = int(matches[-1])
 
@@ -170,7 +186,7 @@ def parse_drc_report(report_text):
         if not match:
             continue
 
-        vtype = match.group(1).strip()
+        violation_type = match.group(1).strip()
         description = match.group(2).strip().splitlines()[0]
 
         rule_match = re.search(
@@ -197,7 +213,7 @@ def parse_drc_report(report_text):
         ]
 
         result["Violations"].append({
-            "Type": vtype,
+            "Type": violation_type,
             "Description": description,
             "Severity": severity,
             "Details": " | ".join(details)
@@ -206,11 +222,161 @@ def parse_drc_report(report_text):
     return result
 
 
+# ============================================================
+# 3. SMARTER DRC VIOLATION EXPLANATIONS
+# ============================================================
+
+def explain_drc_violation(violation):
+    """
+    Provide rule-based explanations and suggested KiCad checks.
+    These are suggestions, not automatic fixes.
+    """
+
+    violation_type = str(
+        violation.get("Type", "")
+    ).lower().replace("-", "_").replace(" ", "_")
+
+    description = str(
+        violation.get("Description", "")
+    )
+
+    details = str(
+        violation.get("Details", "")
+    )
+
+    combined = (
+        violation_type + " " + description + " " + details
+    ).lower()
+
+    rules = [
+        (
+            ("silk_overlap", "silkscreen"),
+            "Silkscreen objects or labels may overlap.",
+            "Inspect the F.Silkscreen or B.Silkscreen layer "
+            "at the reported location. Check whether labels "
+            "are readable. Move or resize objects if needed."
+        ),
+        (
+            ("clearance", "copper_clearance", "edge_clearance"),
+            "Objects may be closer than the configured "
+            "clearance rule allows.",
+            "Zoom to the reported coordinates. Identify the "
+            "objects and nets, compare the spacing with the "
+            "configured board rules, and rerun DRC after changes."
+        ),
+        (
+            ("unconnected", "unconnected_items", "missing_connection"),
+            "A pad or item may not be electrically connected "
+            "as intended.",
+            "Inspect the reported pad, net, and ratsnest in "
+            "KiCad. Confirm the intended connection and route "
+            "it if required."
+        ),
+        (
+            ("shorting_items", "short_circuit", "shorted", "shorting"),
+            "Objects that should be electrically separate "
+            "may be touching or connected.",
+            "Inspect the involved nets and copper. Verify net "
+            "assignments and remove unintended connections "
+            "if the short is confirmed."
+        ),
+        (
+            ("track_width", "width"),
+            "A track may not satisfy the configured "
+            "width constraint.",
+            "Check the affected net class, track width, current "
+            "requirements, and fabrication constraints. A "
+            "universal width is not suitable for every design."
+        ),
+        (
+            ("via_dangling", "dangling_via", "via"),
+            "The report may indicate a via-related rule issue.",
+            "Inspect the via, connected layers, net, and nearby "
+            "copper. Confirm that the via is intentional and "
+            "satisfies the configured board rules."
+        ),
+        (
+            ("footprint", "courtyard"),
+            "A footprint-related or footprint-spacing issue "
+            "may exist.",
+            "Inspect the footprint outline, courtyard, pads, "
+            "orientation, and placement. Confirm that the "
+            "footprint matches the intended component."
+        ),
+        (
+            ("hole_clearance", "hole", "drill"),
+            "A hole or drill feature may conflict with another "
+            "object or configured rule.",
+            "Inspect the hole, nearby copper, board edge, and "
+            "components. Check drill size and required "
+            "clearances against fabrication requirements."
+        ),
+        (
+            ("annular_width", "annular_ring"),
+            "A pad or via may have insufficient annular ring.",
+            "Check pad or via diameter, drill size, configured "
+            "annular-ring rules, and fabricator requirements."
+        ),
+        (
+            ("copper_edge", "edge_cuts", "board_edge"),
+            "An object may be too close to or outside the "
+            "board outline.",
+            "Inspect the Edge.Cuts outline and the reported "
+            "object. Verify that the board outline is closed "
+            "and the required edge clearance is met."
+        ),
+    ]
+
+    explanation = None
+    suggested_checks = None
+
+    for keywords, meaning, checks in rules:
+        if any(keyword in combined for keyword in keywords):
+            explanation = meaning
+            suggested_checks = checks
+            break
+
+    if explanation is None:
+        explanation = (
+            "This violation type is not covered by a specific "
+            "explanation rule in this prototype."
+        )
+
+        suggested_checks = (
+            "Read the original KiCad DRC description and inspect "
+            "the reported coordinates. Check the relevant board "
+            "setup rule, then rerun DRC after any change."
+        )
+
+    severity = str(
+        violation.get("Severity", "Unspecified")
+    )
+
+    if severity.lower() == "error":
+        priority = "Higher — reported as an error"
+    elif severity.lower() == "warning":
+        priority = "Review — reported as a warning"
+    else:
+        priority = "Unclassified — verify in the original report"
+
+    return {
+        "Type": violation.get("Type", "Unknown"),
+        "Severity": severity,
+        "Priority guidance": priority,
+        "Original description": description,
+        "What it may mean": explanation,
+        "Suggested KiCad checks": suggested_checks,
+        "Reported details": details or "No location details parsed"
+    }
+
+
+# ============================================================
+# 4. PRELIMINARY REVIEW-PRIORITY SCORE
+# ============================================================
+
 def calculate_review_risk(df, threshold, drc):
-    """
-    Calculate a rule-based review-priority score.
-    This is not an AI prediction or safety certification.
-    """
+    """Calculate a heuristic review-priority score."""
+
     total_tracks = len(df)
 
     flagged = (
@@ -231,8 +397,9 @@ def calculate_review_risk(df, threshold, drc):
         )
 
         actions.append(
-            f"Review the {flagged} flagged track segment(s) against "
-            "net classes, current requirements, and fabrication rules."
+            f"Review the {flagged} flagged track segment(s) "
+            "against net classes, current requirements, and "
+            "fabrication rules."
         )
     else:
         reasons.append(
@@ -244,20 +411,24 @@ def calculate_review_risk(df, threshold, drc):
 
     if drc is None:
         actions.append(
-            "Run KiCad Design Rules Checker and upload its .rpt "
-            "or .txt report for additional rule-based review."
+            "Run KiCad Design Rules Checker and upload its "
+            ".rpt or .txt report for additional review."
         )
+
     else:
         coverage = "Includes uploaded KiCad DRC report"
 
         errors = int(drc.get("Errors", 0) or 0)
         warnings = int(drc.get("Warnings", 0) or 0)
+
         unconnected = drc.get("Unconnected pads")
         footprint_errors = drc.get("Footprint errors")
         total = drc.get("Total violations")
 
-        score += min(40.0, errors * 20.0)
-        score += min(24.0, warnings * 8.0)
+        score += (
+            min(40.0, errors * 20.0)
+            + min(24.0, warnings * 8.0)
+        )
 
         if total and not errors and not warnings:
             score += min(24.0, int(total) * 8.0)
@@ -268,8 +439,8 @@ def calculate_review_risk(df, threshold, drc):
             )
 
             actions.append(
-                "Review the original DRC report because the parser "
-                "could not classify every violation."
+                "Review the original DRC report because the "
+                "parser could not classify every violation."
             )
 
         if errors:
@@ -277,7 +448,8 @@ def calculate_review_risk(df, threshold, drc):
                 f"The uploaded DRC report identifies {errors} error(s)."
             )
             actions.append(
-                "Resolve DRC errors, rerun DRC, and review the updated report."
+                "Resolve DRC errors, rerun DRC, and review "
+                "the updated report."
             )
 
         if warnings:
@@ -285,8 +457,8 @@ def calculate_review_risk(df, threshold, drc):
                 f"The uploaded DRC report identifies {warnings} warning(s)."
             )
             actions.append(
-                "Review each DRC warning and decide whether it needs "
-                "correction or is acceptable for the design."
+                "Review each DRC warning and decide whether it "
+                "needs correction or is acceptable for the design."
             )
 
         if unconnected is not None:
@@ -294,11 +466,12 @@ def calculate_review_risk(df, threshold, drc):
 
             if int(unconnected) > 0:
                 reasons.append(
-                    f"The report lists {int(unconnected)} unconnected pad(s)."
+                    f"The report lists {int(unconnected)} "
+                    "unconnected pad(s)."
                 )
                 actions.append(
-                    "Inspect unconnected pads and complete or validate "
-                    "the intended connections."
+                    "Inspect unconnected pads and complete or "
+                    "validate the intended connections."
                 )
 
         if footprint_errors is not None:
@@ -306,11 +479,12 @@ def calculate_review_risk(df, threshold, drc):
 
             if int(footprint_errors) > 0:
                 reasons.append(
-                    f"The report lists {int(footprint_errors)} footprint error(s)."
+                    f"The report lists {int(footprint_errors)} "
+                    "footprint error(s)."
                 )
                 actions.append(
-                    "Inspect footprint errors, pad mapping, and footprint "
-                    "placement in KiCad."
+                    "Inspect footprint errors, pad mapping, "
+                    "and footprint placement in KiCad."
                 )
 
         if (
@@ -320,12 +494,17 @@ def calculate_review_risk(df, threshold, drc):
             and footprint_errors in (0, None)
         ):
             reasons.append(
-                "No DRC errors or warnings were counted by the parser; "
-                "check the original report for completeness."
+                "No DRC errors or warnings were counted by "
+                "the parser; check the original report for completeness."
             )
 
     score = int(round(min(100.0, max(0.0, score))))
-    level = "Low" if score < 25 else "Medium" if score < 60 else "High"
+
+    level = (
+        "Low" if score < 25
+        else "Medium" if score < 60
+        else "High"
+    )
 
     if not actions:
         actions.append(
@@ -343,7 +522,7 @@ def calculate_review_risk(df, threshold, drc):
 
 
 # ============================================================
-# 2. ROUTING DENSITY CALCULATION
+# 5. ROUTING DENSITY ANALYSIS
 # ============================================================
 
 def calculate_routing_density(tracks, divisions=10):
@@ -351,8 +530,9 @@ def calculate_routing_density(tracks, divisions=10):
     Estimate routing density by counting distinct track segments
     passing through each grid cell.
 
-    This is a geometry-based proxy, not copper-area analysis or DRC.
+    This is a geometry-based proxy, not copper-area analysis.
     """
+
     if not tracks:
         empty = pd.DataFrame()
         return empty, empty, empty, [], (0, 1, 0, 1)
@@ -372,7 +552,6 @@ def calculate_routing_density(tracks, divisions=10):
     x_min, x_max = min(xs), max(xs)
     y_min, y_max = min(ys), max(ys)
 
-    # Avoid zero-sized ranges for horizontal or vertical-only tracks.
     if x_max == x_min:
         x_min -= 0.5
         x_max += 0.5
@@ -396,11 +575,7 @@ def calculate_routing_density(tracks, divisions=10):
         y2 = float(track["Y2"])
 
         length = math.hypot(x2 - x1, y2 - y1)
-
-        step_size = max(
-            0.01,
-            min(cell_w, cell_h) / 2
-        )
+        step_size = max(0.01, min(cell_w, cell_h) / 2)
 
         samples = max(
             2,
@@ -449,7 +624,7 @@ def calculate_routing_density(tracks, divisions=10):
                 "Y end (mm)": round(
                     y_min + (row + 1) * cell_h, 3
                 ),
-                "Segment occupancy": counts[row][col],
+                "Segment occupancy": counts[row][col]
             })
 
     grid_df = pd.DataFrame(cell_rows)
@@ -476,10 +651,12 @@ def calculate_routing_density(tracks, divisions=10):
             & (grid_df["Segment occupancy"] > 0)
         ].copy()
 
-        hotspots = hotspots.sort_values(
-            "Segment occupancy",
-            ascending=False
-        ).reset_index(drop=True)
+        hotspots = (
+            hotspots
+            .sort_values("Segment occupancy", ascending=False)
+            .reset_index(drop=True)
+        )
+
     else:
         hotspots = pd.DataFrame(columns=grid_df.columns)
 
@@ -514,21 +691,20 @@ def calculate_routing_density(tracks, divisions=10):
 
 
 # ============================================================
-# 3. PAGE HEADER AND SETTINGS
+# 6. PAGE HEADER AND SETTINGS
 # ============================================================
 
 st.title("🔌 Cloud-Based PCB Design Assistant")
 
 st.write(
-    "Analyze PCB geometry, review track widths, inspect KiCad DRC "
-    "results, and download a combined report."
+    "Analyze PCB geometry, review track widths, inspect KiCad DRC results, "
+    "and download a combined report."
 )
 
 st.info(
-    "Prototype notice: width flags are screening indicators, not proof "
-    "of a violation. DRC results are imported from a report; this app "
-    "does not currently run the KiCad DRC engine. The review-priority "
-    "score is rule-based, not AI/ML."
+    "Prototype notice: width flags are screening indicators, not proof of a "
+    "violation. DRC results are imported from a report; this app does not run "
+    "the KiCad DRC engine. The review-priority score is rule-based, not AI/ML."
 )
 
 with st.sidebar:
@@ -544,20 +720,20 @@ with st.sidebar:
     )
 
     st.caption(
-        "Use actual board requirements when known. "
+        "Use the actual board requirements when known. "
         "The default is for demonstration only."
     )
 
 
 # ============================================================
-# 4. DRC REPORT UPLOAD
+# 7. DRC REPORT UPLOAD AND EXPLANATIONS
 # ============================================================
 
 st.header("1. KiCad DRC Report")
 
 st.write(
-    "In KiCad, open Inspect → Design Rules Checker, run DRC, "
-    "save the report, then upload the .rpt or .txt file here."
+    "In KiCad, open Inspect → Design Rules Checker, run DRC, save the "
+    "report, then upload the .rpt or .txt file here."
 )
 
 drc_file = st.file_uploader(
@@ -568,6 +744,7 @@ drc_file = st.file_uploader(
 
 drc_results = None
 drc_text = None
+drc_explanations = []
 
 if drc_file is not None:
     try:
@@ -597,12 +774,16 @@ if drc_file is not None:
         )
 
         if drc_results["Total violations"] == 0:
-            st.success("The report indicates zero DRC violations.")
+            st.success(
+                "The report indicates zero DRC violations."
+            )
+
         elif drc_results["Total violations"] is not None:
             st.warning(
                 f"KiCad reported {drc_results['Total violations']} "
                 "DRC violation(s). Review the details below."
             )
+
         else:
             st.info(
                 "The total count could not be identified automatically. "
@@ -648,10 +829,77 @@ if drc_file is not None:
 
         elif drc_results["Total violations"] == 0:
             st.success("No individual violations were listed.")
+
         else:
             st.info(
                 "No individual violation entries were recognized. "
                 "See the original report."
+            )
+
+        st.subheader(
+            "DRC Violation Explanations and Suggested Checks"
+        )
+
+        st.caption(
+            "These explanations are rule-based guidance derived from "
+            "the violation type and report text. They are not automatic "
+            "fixes. Verify every issue in KiCad and rerun DRC."
+        )
+
+        drc_explanations = [
+            explain_drc_violation(item)
+            for item in drc_results["Violations"]
+        ]
+
+        if drc_explanations:
+            explanation_df = pd.DataFrame(drc_explanations)
+
+            st.dataframe(
+                explanation_df,
+                use_container_width=True,
+                hide_index=True
+            )
+
+            st.download_button(
+                "Download DRC explanations as CSV",
+                explanation_df.to_csv(index=False).encode("utf-8"),
+                "pcb_drc_explanations.csv",
+                "text/csv",
+                key="download_drc_explanations"
+            )
+
+            for index, item in enumerate(
+                drc_explanations,
+                start=1
+            ):
+                with st.expander(
+                    f"Violation {index}: {item['Type']} — "
+                    f"{item['Priority guidance']}"
+                ):
+                    st.markdown(
+                        f"**Original description:** "
+                        f"{item['Original description']}"
+                    )
+
+                    st.markdown(
+                        f"**What it may mean:** "
+                        f"{item['What it may mean']}"
+                    )
+
+                    st.markdown(
+                        f"**Suggested KiCad checks:** "
+                        f"{item['Suggested KiCad checks']}"
+                    )
+
+                    st.markdown(
+                        f"**Reported details:** "
+                        f"{item['Reported details']}"
+                    )
+
+        else:
+            st.info(
+                "No individual violations were recognized for explanation. "
+                "Check the original report if you expected violations."
             )
 
         with st.expander("View full original DRC report"):
@@ -671,11 +919,12 @@ if drc_file is not None:
             "Export a plain-text report from KiCad and try again."
         )
 
+
 st.divider()
 
 
 # ============================================================
-# 5. PCB FILE UPLOAD
+# 8. PCB FILE UPLOAD
 # ============================================================
 
 st.header("2. PCB Geometry and Track Analysis")
@@ -694,14 +943,14 @@ if uploaded_file is None:
     2. Upload a KiCad PCB file to inspect geometry.
     3. Review components, track segments, and vias.
     4. Adjust the track-width screening threshold.
-    5. Review the preliminary risk score and routing-density analysis.
-    6. Download the results and combined report.
+    5. Review the preliminary risk score and download the results.
     """)
+
     st.stop()
 
 
 # ============================================================
-# 6. PARSE PCB AND RUN ANALYSIS
+# 9. PCB ANALYSIS
 # ============================================================
 
 try:
@@ -726,10 +975,8 @@ try:
 
     df["Review Flag"] = df["Width (mm)"].apply(
         lambda width: (
-            "Unknown width"
-            if pd.isna(width)
-            else "Review width"
-            if width < min_width
+            "Unknown width" if pd.isna(width)
+            else "Review width" if width < min_width
             else "No width flag"
         )
     )
@@ -750,7 +997,7 @@ try:
 
 
     # ========================================================
-    # 7. PRELIMINARY RISK SCORE
+    # 10. RISK SCORE
     # ========================================================
 
     st.header("3. Preliminary Risk Score and Reasons")
@@ -783,11 +1030,13 @@ try:
             "High review priority — investigate the listed issues "
             "before fabrication."
         )
+
     elif risk["level"] == "Medium":
         st.warning(
             "Medium review priority — inspect the listed issues "
             "against design rules."
         )
+
     else:
         st.info(
             "Low review priority based on the checks available. "
@@ -812,14 +1061,14 @@ try:
     d.metric("Tracks flagged", flagged_count)
 
     st.caption(
-        f"Screening threshold: {min_width:.2f} mm. "
-        "A flag means a track needs review against actual design rules; "
-        "it does not prove the track is defective."
+        f"Screening threshold: {min_width:.2f} mm. A flag means "
+        "a track needs review against actual design rules; it does "
+        "not prove the track is defective."
     )
 
 
     # ========================================================
-    # 8. TRACK REVIEW TABLE
+    # 11. TRACK REVIEW AND CSV DOWNLOAD
     # ========================================================
 
     st.subheader("Track Review")
@@ -837,10 +1086,12 @@ try:
         shown_df = df[
             df["Review Flag"] != "No width flag"
         ]
+
     elif filter_choice == "Tracks without width flags":
         shown_df = df[
             df["Review Flag"] == "No width flag"
         ]
+
     else:
         shown_df = df
 
@@ -867,7 +1118,7 @@ try:
 
 
     # ========================================================
-    # 9. TRACK VISUALIZATION
+    # 12. TRACK VISUALIZATION
     # ========================================================
 
     st.subheader("Extracted Track Visualization")
@@ -886,16 +1137,18 @@ try:
     ax.set_title("Extracted PCB Track Segments")
     ax.set_aspect("equal", adjustable="datalim")
     ax.grid(True, alpha=0.3)
-    fig.tight_layout()
 
+    fig.tight_layout()
     st.pyplot(fig)
 
     image_buffer = BytesIO()
+
     fig.savefig(
         image_buffer,
         format="png",
         dpi=150
     )
+
     plt.close(fig)
 
     st.download_button(
@@ -907,7 +1160,7 @@ try:
 
 
     # ========================================================
-    # 10. COMPONENT REFERENCES
+    # 13. COMPONENT REFERENCES
     # ========================================================
 
     st.subheader("Component References")
@@ -922,7 +1175,7 @@ try:
 
 
     # ========================================================
-    # 11. ANALYSIS SUMMARY
+    # 14. ANALYSIS SUMMARY
     # ========================================================
 
     st.subheader("Analysis Summary")
@@ -960,15 +1213,16 @@ try:
 
 
     # ========================================================
-    # 12. ROUTING DENSITY ANALYSIS
+    # 15. ROUTING DENSITY ANALYSIS
     # ========================================================
 
     st.header("4. Routing Density Analysis")
 
     st.caption(
         "This heatmap estimates routing density from track-segment "
-        "occupancy in grid cells. It does not calculate exact copper area "
-        "or prove congestion, clearance problems, or electrical/thermal issues."
+        "occupancy in grid cells. It does not calculate exact copper "
+        "area or prove congestion, clearance problems, or electrical "
+        "or thermal issues."
     )
 
     grid_divisions = st.slider(
@@ -1072,9 +1326,9 @@ try:
 
         if not hotspot_df.empty:
             st.warning(
-                f"{len(hotspot_df)} grid cell(s) have relatively high "
-                "segment occupancy at the selected grid resolution. "
-                "Inspect these areas in KiCad."
+                f"{len(hotspot_df)} grid cell(s) have relatively "
+                "high segment occupancy at the selected grid "
+                "resolution. Inspect these areas in KiCad."
             )
 
             st.dataframe(
@@ -1094,11 +1348,8 @@ try:
             density_recommendations = [
                 "Inspect the flagged coordinates in KiCad's board editor.",
                 "Run KiCad DRC to check clearances and other configured board rules.",
-                (
-                    "For high-current or high-speed nets, separately verify "
-                    "width, return paths, impedance, thermal rise, and signal "
-                    "integrity as applicable."
-                )
+                "For high-current or high-speed nets, separately verify width, "
+                "return paths, impedance, thermal rise, and signal integrity as applicable."
             ]
 
         else:
@@ -1109,14 +1360,8 @@ try:
             )
 
             density_recommendations = [
-                (
-                    "If congestion is suspected, change the grid resolution "
-                    "and inspect the board in KiCad."
-                ),
-                (
-                    "Run KiCad DRC and perform project-specific electrical "
-                    "and thermal checks as needed."
-                )
+                "If congestion is suspected, change the grid resolution and inspect the board in KiCad.",
+                "Run KiCad DRC and perform project-specific electrical and thermal checks as needed."
             ]
 
         st.markdown("**Routing density recommendations**")
@@ -1138,13 +1383,13 @@ try:
         ]
 
         st.info(
-            "Routing density could not be calculated because "
-            "track geometry was unavailable."
+            "Routing density could not be calculated because track "
+            "geometry was unavailable."
         )
 
 
     # ========================================================
-    # 13. PREPARE DRC SECTION FOR COMBINED HTML REPORT
+    # 16. BUILD THE COMBINED HTML REPORT
     # ========================================================
 
     if drc_results is None:
@@ -1167,11 +1412,7 @@ try:
             ],
             "Result": [
                 drc_file.name,
-                (
-                    total_drc
-                    if total_drc is not None
-                    else "Not identified"
-                ),
+                total_drc if total_drc is not None else "Not identified",
                 drc_results["Errors"],
                 drc_results["Warnings"],
                 (
@@ -1200,16 +1441,31 @@ try:
                 ).to_html(index=False, escape=True)
             )
 
+        if drc_explanations:
+            drc_html_section += (
+                "<h3>Rule-Based DRC Explanations and Suggested KiCad Checks</h3>"
+                "<p>Guidance is heuristic and must be verified against "
+                "the board and its configured rules.</p>"
+                + pd.DataFrame(
+                    drc_explanations
+                ).to_html(index=False, escape=True)
+            )
+
         drc_html_section += (
             "<h3>Original DRC Report</h3><pre>"
             + html.escape(drc_text or "")
             + "</pre>"
         )
 
+    reasons_html = "".join(
+        f"<li>{html.escape(item)}</li>"
+        for item in risk["reasons"]
+    )
 
-    # ========================================================
-    # 14. PREPARE ROUTING DENSITY REPORT SECTION
-    # ========================================================
+    actions_html = "".join(
+        f"<li>{html.escape(item)}</li>"
+        for item in risk["recommendations"]
+    )
 
     density_layer_html = (
         layer_df.to_html(index=False, escape=True)
@@ -1221,15 +1477,16 @@ try:
         hotspot_df.to_html(index=False, escape=True)
         if not hotspot_df.empty
         else (
-            "<p>No relative high-density cells were flagged at "
-            "the selected grid resolution.</p>"
+            "<p>No relative high-density cells were flagged "
+            "at the selected grid resolution.</p>"
         )
     )
 
     density_html_section = (
         "<h2>Routing Density Analysis</h2>"
-        "<p>Grid-cell segment occupancy is a geometry-based density proxy. "
-        "It is not exact copper-area analysis and does not prove actual congestion.</p>"
+        "<p>Grid-cell segment occupancy is a geometry-based density "
+        "proxy. It is not exact copper-area analysis and does not "
+        "prove actual congestion.</p>"
         f"<p><strong>Grid resolution:</strong> "
         f"{grid_divisions} × {grid_divisions}</p>"
         "<h3>Layer-wise Track Statistics</h3>"
@@ -1242,21 +1499,6 @@ try:
             for item in density_recommendations
         )
         + "</ul>"
-    )
-
-
-    # ========================================================
-    # 15. COMBINED HTML REPORT
-    # ========================================================
-
-    reasons_html = "".join(
-        f"<li>{html.escape(item)}</li>"
-        for item in risk["reasons"]
-    )
-
-    actions_html = "".join(
-        f"<li>{html.escape(item)}</li>"
-        for item in risk["recommendations"]
     )
 
     report_html = f"""<!DOCTYPE html>
@@ -1297,28 +1539,17 @@ pre {{
 </style>
 </head>
 <body>
-
 <h1>Cloud-Based PCB Design Assistant</h1>
-
-<p><strong>PCB file:</strong>
-{html.escape(uploaded_file.name)}</p>
-
-<p><strong>Generated:</strong>
-{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
+<p><strong>PCB file:</strong> {html.escape(uploaded_file.name)}</p>
+<p><strong>Generated:</strong> {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
 
 <h2>PCB Geometry Summary</h2>
 {summary.to_html(index=False, escape=True)}
 
 <h2>Preliminary Risk Score and Reasons</h2>
-
-<p><strong>Review-priority score:</strong>
-{risk['score']}/100</p>
-
-<p><strong>Review level:</strong>
-{html.escape(risk['level'])}</p>
-
-<p><strong>Evidence coverage:</strong>
-{html.escape(risk['coverage'])}</p>
+<p><strong>Review-priority score:</strong> {risk['score']}/100</p>
+<p><strong>Review level:</strong> {html.escape(risk['level'])}</p>
+<p><strong>Evidence coverage:</strong> {html.escape(risk['coverage'])}</p>
 
 <h3>Reasons</h3>
 <ul>{reasons_html}</ul>
@@ -1332,32 +1563,23 @@ pre {{
 {df[display_columns].to_html(index=False, escape=True)}
 
 <h2>Component References</h2>
-<p>{
-    html.escape(", ".join(components))
-    if components
-    else "None extracted"
-}</p>
+<p>{html.escape(', '.join(components)) if components else 'None extracted'}</p>
 
 {drc_html_section}
 
 <h2>Limitations</h2>
-
 <p>
-Track-width flags are screening results based on the selected threshold
-and do not prove a design-rule violation. The review-priority score is
-a heuristic based only on the checks listed in this report; it is not
-an AI/ML prediction. KiCad DRC results are imported from a separately
-generated report. This website does not execute the KiCad DRC engine
-or certify manufacturing, electrical safety, EMI, thermal performance,
-component placement, routing quality, or signal integrity. Routing
-density is a grid-based segment-occupancy estimate and must not be
-treated as proof of congestion or as a substitute for KiCad DRC and
-engineering analysis.
+Track-width flags are screening results based on the selected threshold and do not
+prove a design-rule violation. The review-priority score is a heuristic based only on
+the checks listed in this report; it is not an AI/ML prediction. KiCad DRC results are
+imported from a separately generated report. This website does not execute the KiCad
+DRC engine or certify manufacturing, electrical safety, EMI, thermal performance,
+component placement, routing quality, or signal integrity. Routing density is a
+grid-based segment-occupancy estimate and must not be treated as proof of congestion
+or as a substitute for KiCad DRC and engineering analysis.
 </p>
-
 </body>
-</html>
-"""
+</html>"""
 
     st.download_button(
         "Download Combined PCB and DRC HTML Report",
